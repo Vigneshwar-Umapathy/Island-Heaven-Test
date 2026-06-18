@@ -1,0 +1,13 @@
+frontend:
+  - "frontend/**"
+
+backend:
+  - "backend/**"
+
+ci:
+  - ".github/workflows/**"
+  - ".github/utils/**"
+  - "Taskfile.yaml"
+
+docs:
+  - "**/*.md"
