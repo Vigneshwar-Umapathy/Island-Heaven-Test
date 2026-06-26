@@ -1,175 +1,43 @@
-name: CI/CD - Production
+name: Frontend CI/CD - Safemod (QA)
 
 on:
+  push:
+    branches:
+      - dev
+    paths:
+      - 'frontend/**'
+      - '.github/workflows/frontend-qa.yml'
+
   pull_request:
-    branches: [main]
-    types: [closed]
+    branches:
+      - dev
+    paths:
+      - 'frontend/**'
+      - '.github/workflows/frontend-qa.yml'
+
   workflow_dispatch:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: frontend-${{ github.ref }}
   cancel-in-progress: true
 
-# Principle of least privilege — only what each job needs
 permissions:
-  id-token: write   # Required for OIDC AWS auth
+  id-token: write
   contents: read
   pull-requests: read
 
 jobs:
-  # ---------------------------------------------------------------
-  # Gate: only run on merged PRs or manual dispatch
-  # ---------------------------------------------------------------
-  guard:
-    if: github.event.pull_request.merged == true || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    outputs:
-      frontend: ${{ steps.filter.outputs.frontend }}
-      backend: ${{ steps.filter.outputs.backend }}
-    steps:
-      # Pinned SHA — prevents supply chain attacks on checkout action
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        with:
-          ref: ${{ github.ref }}
-
-      # Pinned SHA — prevents supply chain attacks on path filter action
-      - uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36
-        id: filter
-        with:
-          filters: .github/utils/file-filter.yml
-          base: ${{ github.event_name == 'pull_request' && '' || github.sha }}
-
-  # ---------------------------------------------------------------
-  # Frontend CI: lint → type-check → build → security scan
-  # ---------------------------------------------------------------
-  frontend-ci:
-    needs: guard
-    if: github.event_name == 'workflow_dispatch' || needs.guard.outputs.frontend == 'true'
-    runs-on: ubuntu-latest
-    environment: production   # Requires required reviewer approval in GitHub
-    defaults:
-      run:
-        working-directory: frontend
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-
-      - uses: pnpm/action-setup@a3252b7022175f0d20003816332aacfbd73e57ec
-        with:
-          version: '10'
-
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
-        with:
-          node-version: '20'
-          cache: 'pnpm'
-          cache-dependency-path: frontend/pnpm-lock.yaml
-
-      - name: Install dependencies
-        run: pnpm install --frozen-lockfile
-
-      - name: Lint
-        run: pnpm lint
-
-      - name: Type check
-        run: pnpm exec tsc --noEmit
-
-      - name: Build
-        run: pnpm build
-
-      # Scan for known vulnerabilities in npm packages
-      - name: Audit npm dependencies
-        run: pnpm audit --audit-level=high
-
-      # Scan Docker images / filesystem for CVEs
-      - name: Trivy filesystem scan
-        uses: aquasecurity/trivy-action@6e7b7d1fd3e4fef0c5fa8cce1229c54b2c9bd0d8
-        with:
-          scan-type: fs
-          scan-ref: frontend
-          severity: HIGH,CRITICAL
-          exit-code: '1'
-
-      # Configure AWS credentials via OIDC (no long-lived keys stored)
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502
-        with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: us-east-1
-          role-session-name: GitHubActions-Frontend-Prod
-
-      - name: Deploy frontend to S3
-        run: |
-          aws s3 sync dist/ s3://${{ vars.S3_BUCKET_NAME }}/${{ vars.DEPLOYMENT_PATH_FRONTEND }} \
-            --delete \
-            --cache-control "public, max-age=31536000, immutable"
-        env:
-          AWS_REGION: us-east-1
-
-  # ---------------------------------------------------------------
-  # Backend CI: security scan → lint → tests → deploy
-  # ---------------------------------------------------------------
-  backend-ci:
-    needs: guard
-    if: github.event_name == 'workflow_dispatch' || needs.guard.outputs.backend == 'true'
-    runs-on: ubuntu-latest
-    environment: production   # Requires required reviewer approval in GitHub
-    defaults:
-      run:
-        working-directory: backend
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
-        with:
-          python-version: '3.12'
-          cache: pip
-
-      - name: Install dependencies
-        run: pip install -r requirements.txt
-
-      # SAST: static analysis for common Python security issues
-      - name: Bandit SAST scan
-        run: |
-          pip install bandit
-          bandit -r app/ -ll -ii --exit-zero
-
-      # SCA: check for known vulnerable packages
-      - name: pip-audit dependency scan
-        run: |
-          pip install pip-audit
-          pip-audit --requirement requirements.txt --severity high
-
-      # Filesystem vulnerability scan
-      - name: Trivy filesystem scan
-        uses: aquasecurity/trivy-action@6e7b7d1fd3e4fef0c5fa8cce1229c54b2c9bd0d8
-        with:
-          scan-type: fs
-          scan-ref: backend
-          severity: HIGH,CRITICAL
-          exit-code: '1'
-
-      # Run tests (add your test runner here — pytest is standard for FastAPI)
-      - name: Run tests
-        run: |
-          pip install pytest pytest-asyncio httpx
-          pytest tests/ -v --tb=short || echo "No tests directory found — add tests!"
-        continue-on-error: false
-
-      # Configure AWS credentials via OIDC
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502
-        with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: us-east-1
-          role-session-name: GitHubActions-Backend-Prod
-
-      - name: Pull env file from S3
-        run: |
-          aws s3 cp s3://${{ vars.S3_BUCKET_NAME }}/${{ vars.ENV_FILE_SOURCE_BACKEND }} .env
-
-      - name: Deploy backend via SSM (restart service)
-        run: |
-          aws ssm send-command \
-            --document-name "AWS-RunShellScript" \
-            --targets "Key=tag:Environment,Values=production" \
-            --parameters commands=["cd ${{ vars.DEPLOYMENT_PATH_BACKEND }} && git pull && pip install -r requirements.txt && sudo systemctl restart ${{ vars.SERVICE_NAME_BACKEND }}"] \
-            --comment "Deploy backend - ${{ github.sha }}"
+  frontend:
+    uses: tensoractai/operation/.github/workflows/vite-nextjs-ci.yml@main
+    with:
+      node-version: '20'
+      pnpm-version: '10'
+      working-directory: 'frontend'
+      aws-region: 'us-east-1'
+      deploy-runner: 'qa-safemod'
+      debug_enabled: false
+      s3-bucket: ${{ vars.QA_S3_BUCKET_NAME }}
+      deploy-path: ${{ vars.DEPLOYMENT_PATH_FRONTEND }}
+      env-source-path: ${{ vars.ENV_FILE_SOURCE_FRONTEND }}
+    secrets:
+      aws-role-arn: ${{ secrets.QA_AWS_ROLE_ARN }}
